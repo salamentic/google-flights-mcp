@@ -1,420 +1,481 @@
-# /// script
-# requires-python = ">=3.12"
-# dependencies = []
-# ///
+#!/usr/bin/env python3
+"""
+Flight Planner Server using FastMCP
 
-from mcp.server.fastmcp import FastMCP, Context
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+An MCP server that uses the fast-flights API to search for flight information,
+with comprehensive airport data from a public CSV source.
+"""
+
+import sys
+import os
 import json
+import csv
+import io
+import asyncio
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any, Tuple
+from pathlib import Path
+
+# Print debug info to stderr (will be captured in Claude logs)
+print("Starting Flight Planner server...", file=sys.stderr)
 
 try:
-    from fast_flights import FlightData, Passengers, Result, get_flights
-except ImportError:
-    print("fast-flights package not installed. Install with: pip install fast-flights")
-    
-# Create an MCP server
-mcp = FastMCP("FlightPlanner")
+    from fastmcp import FastMCP, Context
+    print("Successfully imported FastMCP", file=sys.stderr)
+except ImportError as e:
+    print(f"Error importing FastMCP: {e}", file=sys.stderr)
+    print("Please install FastMCP with: uv pip install fastmcp", file=sys.stderr)
+    sys.exit(1)
 
-class FlightPlanningTool:
-    """Helper class to deal with the flight planning tools"""
+# Constants
+CSV_URL = "https://raw.githubusercontent.com/mborsetti/airportsdata/refs/heads/main/airportsdata/airports.csv"
+DEFAULT_CONFIG = {
+    "max_results": 10,
+    "default_trip_days": 7,
+    "default_advance_days": 30,
+    "seat_classes": ["economy", "premium_economy", "business", "first"]
+}
+AIRPORTS_CACHE_FILE = Path(__file__).parent / "airports_cache.json"
+
+# Global variables
+airports = {}
+
+# Fetch airport data from CSV
+async def fetch_airports_csv(url: str = CSV_URL) -> Dict[str, str]:
+    """Fetch airport data from a CSV URL."""
+    print(f"Fetching airports from {url}", file=sys.stderr)
     
-    @staticmethod
-    def format_flight_result(result: Result) -> str:
-        """Format a flight result object into a readable string"""
-        if not result or not result.flights:
-            return "No flights found."
-            
-        output = []
-        output.append(f"Current price trend: {result.current_price}")
+    try:
+        import aiohttp
         
-        for i, flight in enumerate(result.flights[:10]):  # Limit to 10 flights for readability
-            output.append(f"\nFlight {i+1}:")
-            output.append(f"  {'✓ BEST OPTION' if flight.is_best else ''}")
-            output.append(f"  Name: {flight.name}")
-            output.append(f"  Departure: {flight.departure}")
-            output.append(f"  Arrival: {flight.arrival}")
-            output.append(f"  {'Arrives ahead: ' + str(flight.arrival_time_ahead) if flight.arrival_time_ahead else ''}")
-            output.append(f"  Duration: {flight.duration}")
-            output.append(f"  Stops: {flight.stops}")
-            output.append(f"  Price: {flight.price}")
-            
-            if hasattr(flight, 'delay') and flight.delay:
-                output.append(f"  Delay: {flight.delay}")
+        airports_data = {}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    print(f"Error fetching CSV: HTTP {response.status}", file=sys.stderr)
+                    return {}
                 
-        return "\n".join(output)
-
-@mcp.tool()
-def search_one_way_flights(
-    from_airport: str, 
-    to_airport: str, 
-    departure_date: str, 
-    adults: int = 1, 
-    children: int = 0, 
-    infants_in_seat: int = 0, 
-    infants_on_lap: int = 0,
-    seat_class: str = "economy"
-) -> str:
-    """
-    Search for one-way flights using the fast-flights API.
-    
-    Args:
-        from_airport: Departure airport code (e.g., "NYC", "LAX", "TPE")
-        to_airport: Arrival airport code (e.g., "MYJ", "SFO", "LHR")
-        departure_date: Departure date in YYYY-MM-DD format
-        adults: Number of adult passengers (default: 1)
-        children: Number of children passengers (default: 0)
-        infants_in_seat: Number of infants in seat (default: 0)
-        infants_on_lap: Number of infants on lap (default: 0)
-        seat_class: Class of seat, one of "economy", "premium-economy", "business", "first" (default: "economy")
-    
-    Returns:
-        String with formatted flight information
-    """
-    try:
-        # Validate date format
-        datetime.strptime(departure_date, "%Y-%m-%d")
-        
-        # Validate seat class
-        valid_seat_classes = ["economy", "premium-economy", "business", "first"]
-        if seat_class not in valid_seat_classes:
-            return f"Invalid seat class. Must be one of: {', '.join(valid_seat_classes)}"
-            
-        # Create flight data object
-        flight_data = [
-            FlightData(date=departure_date, from_airport=from_airport, to_airport=to_airport)
-        ]
-        
-        # Create passengers object
-        passengers = Passengers(
-            adults=adults,
-            children=children,
-            infants_in_seat=infants_in_seat,
-            infants_on_lap=infants_on_lap
-        )
-        
-        # Get flights
-        result = get_flights(
-            flight_data=flight_data,
-            trip="one-way",
-            seat=seat_class,
-            passengers=passengers,
-            fetch_mode="fallback"
-        )
-        
-        # Format the result
-        return FlightPlanningTool.format_flight_result(result)
-        
+                csv_text = await response.text()
+                csv_reader = csv.DictReader(io.StringIO(csv_text))
+                
+                for row in csv_reader:
+                    iata = row.get('iata', '')
+                    name = row.get('name', '')
+                    city = row.get('city', '')
+                    country = row.get('country', '')
+                    
+                    # Only store entries with a valid IATA code (3 uppercase letters)
+                    if iata and len(iata) == 3 and iata.isalpha() and iata.isupper():
+                        # Include city and country in the name for better context
+                        full_name = f"{name}, {city}, {country}" if city else f"{name}, {country}"
+                        airports_data[iata] = full_name
+                
+                print(f"Loaded {len(airports_data)} airports from CSV", file=sys.stderr)
+                
+                # Save to cache file
+                try:
+                    with open(AIRPORTS_CACHE_FILE, 'w') as f:
+                        json.dump(airports_data, f)
+                    print(f"Saved airports to cache file: {AIRPORTS_CACHE_FILE}", file=sys.stderr)
+                except Exception as cache_e:
+                    print(f"Warning: Could not save airports cache: {cache_e}", file=sys.stderr)
+                
+                return airports_data
+    except ImportError:
+        print("aiohttp not installed. Cannot fetch airports CSV.", file=sys.stderr)
+        print("Please install with: uv pip install aiohttp", file=sys.stderr)
+        return {}
     except Exception as e:
-        return f"Error searching for flights: {str(e)}"
+        print(f"Error fetching airports: {e}", file=sys.stderr)
+        return {}
+
+# Load airports from cache if available
+def load_airports_cache() -> Dict[str, str]:
+    """Load airports from cache file if available."""
+    if AIRPORTS_CACHE_FILE.exists():
+        try:
+            with open(AIRPORTS_CACHE_FILE, 'r') as f:
+                cache = json.load(f)
+                print(f"Loaded {len(cache)} airports from cache", file=sys.stderr)
+                return cache
+        except Exception as e:
+            print(f"Error loading airports cache: {e}", file=sys.stderr)
+    return {}
+
+# Initialize the FastMCP server with dependencies
+mcp = FastMCP(
+    "Flight Planner", 
+    dependencies=["fast-flights", "aiohttp"]
+)
 
 @mcp.tool()
-def search_round_trip_flights(
+def search_flights(
     from_airport: str, 
-    to_airport: str, 
-    departure_date: str,
-    return_date: str,
-    adults: int = 1, 
-    children: int = 0, 
-    infants_in_seat: int = 0, 
-    infants_on_lap: int = 0,
-    seat_class: str = "economy"
-) -> str:
-    """
-    Search for round-trip flights using the fast-flights API.
-    
-    Args:
-        from_airport: Departure airport code (e.g., "NYC", "LAX", "TPE")
-        to_airport: Arrival airport code (e.g., "MYJ", "SFO", "LHR")
-        departure_date: Outbound departure date in YYYY-MM-DD format
-        return_date: Return departure date in YYYY-MM-DD format
-        adults: Number of adult passengers (default: 1)
-        children: Number of children passengers (default: 0)
-        infants_in_seat: Number of infants in seat (default: 0)
-        infants_on_lap: Number of infants on lap (default: 0)
-        seat_class: Class of seat, one of "economy", "premium-economy", "business", "first" (default: "economy")
-    
-    Returns:
-        String with formatted flight information
-    """
-    try:
-        # Validate date format
-        datetime.strptime(departure_date, "%Y-%m-%d")
-        datetime.strptime(return_date, "%Y-%m-%d")
-        
-        # Validate return date is after departure date
-        if departure_date >= return_date:
-            return "Return date must be after departure date."
-        
-        # Validate seat class
-        valid_seat_classes = ["economy", "premium-economy", "business", "first"]
-        if seat_class not in valid_seat_classes:
-            return f"Invalid seat class. Must be one of: {', '.join(valid_seat_classes)}"
-            
-        # Create flight data objects for both directions
-        flight_data = [
-            FlightData(date=departure_date, from_airport=from_airport, to_airport=to_airport),
-            FlightData(date=return_date, from_airport=to_airport, to_airport=from_airport)
-        ]
-        
-        # Create passengers object
-        passengers = Passengers(
-            adults=adults,
-            children=children,
-            infants_in_seat=infants_in_seat,
-            infants_on_lap=infants_on_lap
-        )
-        
-        # Get flights
-        result = get_flights(
-            flight_data=flight_data,
-            trip="round-trip",
-            seat=seat_class,
-            passengers=passengers,
-            fetch_mode="fallback"
-        )
-        
-        # Format the result
-        return FlightPlanningTool.format_flight_result(result)
-        
-    except Exception as e:
-        return f"Error searching for flights: {str(e)}"
-
-@mcp.tool()
-def create_travel_plan(
-    from_airport: str,
     to_airport: str,
     departure_date: str,
     return_date: Optional[str] = None,
-    trip_purpose: str = "vacation",
-    budget_level: str = "moderate",
-    interests: str = "",
+    adults: int = 1,
+    children: int = 0,
+    infants_in_seat: int = 0,
+    infants_on_lap: int = 0,
+    seat_class: str = "economy",
     ctx: Context = None
 ) -> str:
     """
-    Create a comprehensive travel plan including flight options and recommendations.
-    
+    Search for flights between two airports.
+
     Args:
-        from_airport: Departure airport code (e.g., "NYC", "LAX", "TPE")
-        to_airport: Arrival airport code (e.g., "MYJ", "SFO", "LHR")
+        from_airport: Departure airport code (3-letter IATA code, e.g., 'LAX')
+        to_airport: Arrival airport code (3-letter IATA code, e.g., 'JFK')
         departure_date: Departure date in YYYY-MM-DD format
-        return_date: Return date in YYYY-MM-DD format (Optional for one-way trips)
-        trip_purpose: Purpose of the trip (e.g., "vacation", "business", "family visit")
-        budget_level: Budget level, one of "budget", "moderate", "luxury"
-        interests: Comma-separated list of interests for activity recommendations
-        
+        return_date: Return date in YYYY-MM-DD format (optional, for round trips)
+        adults: Number of adult passengers (default: 1)
+        children: Number of children (default: 0)
+        infants_in_seat: Number of infants in seat (default: 0)
+        infants_on_lap: Number of infants on lap (default: 0)
+        seat_class: Seat class (economy, premium_economy, business, first) (default: economy)
+
     Returns:
-        A comprehensive travel plan with flight options and recommendations
+        Flight search results in a formatted string
     """
+    if ctx:
+        ctx.info(f"Searching flights from {from_airport} to {to_airport}")
+    
+    # Validate inputs
     try:
-        is_round_trip = return_date is not None
-        trip_type = "round-trip" if is_round_trip else "one-way"
-        seat_class_recommendation = "economy"
+        # Validate dates
+        departure_datetime = datetime.strptime(departure_date, "%Y-%m-%d")
+        return_datetime = None
+        if return_date:
+            return_datetime = datetime.strptime(return_date, "%Y-%m-%d")
+            if return_datetime < departure_datetime:
+                return "Error: Return date cannot be before departure date."
+            
+        # Validate airport codes
+        if len(from_airport) != 3 or len(to_airport) != 3:
+            return "Error: Airport codes must be 3-letter IATA codes."
         
-        # Adjust seat class based on trip purpose and budget
-        if trip_purpose.lower() == "business" and budget_level.lower() == "luxury":
-            seat_class_recommendation = "business"
-        elif budget_level.lower() == "luxury":
-            seat_class_recommendation = "premium-economy"
-            
-        # Progress tracking
-        if ctx:
-            ctx.info("Starting travel plan creation...")
-            ctx.report_progress(0, 2)
-            
-        # Get flight options
-        if is_round_trip:
-            if ctx:
-                ctx.info("Searching for round-trip flights...")
-            flight_result = search_round_trip_flights(
-                from_airport=from_airport,
-                to_airport=to_airport,
-                departure_date=departure_date,
-                return_date=return_date,
-                seat_class=seat_class_recommendation
-            )
-        else:
-            if ctx:
-                ctx.info("Searching for one-way flights...")
-            flight_result = search_one_way_flights(
-                from_airport=from_airport,
-                to_airport=to_airport,
-                departure_date=departure_date,
-                seat_class=seat_class_recommendation
-            )
-            
-        if ctx:
-            ctx.report_progress(1, 2)
-            ctx.info("Creating travel recommendations...")
-            
-        # Format the travel plan
-        plan_parts = [
-            f"# Travel Plan: {from_airport} to {to_airport}",
-            f"\n## Trip Details",
-            f"- Trip Type: {trip_type}",
-            f"- Departure: {departure_date}",
-        ]
+        # Check if airports exist in our database
+        from_airport = from_airport.upper()
+        to_airport = to_airport.upper()
         
-        if is_round_trip:
-            plan_parts.append(f"- Return: {return_date}")
+        if from_airport not in airports:
+            return f"Error: Departure airport code '{from_airport}' not found in our database."
+        if to_airport not in airports:
+            return f"Error: Arrival airport code '{to_airport}' not found in our database."
             
-        plan_parts.extend([
-            f"- Purpose: {trip_purpose}",
-            f"- Budget Level: {budget_level}",
-            f"\n## Flight Options",
-            flight_result,
-            f"\n## Travel Recommendations",
-            f"Based on your {trip_purpose} trip and {budget_level} budget, here are some recommendations:",
-        ])
-        
-        # Add custom recommendations based on trip parameters
-        if budget_level.lower() == "budget":
-            plan_parts.append("- Consider booking economy flights at least 6 weeks in advance")
-            plan_parts.append("- Look for accommodations with kitchenettes to save on meal costs")
-            plan_parts.append("- Research free activities and attractions at your destination")
-        elif budget_level.lower() == "moderate":
-            plan_parts.append("- Premium economy seats offer better comfort for the price")
-            plan_parts.append("- Consider mid-range hotels or vacation rentals")
-            plan_parts.append("- Mix of paid attractions and free experiences recommended")
-        else:  # luxury
-            plan_parts.append("- Business or first-class seats recommended for maximum comfort")
-            plan_parts.append("- Luxury hotels or private villas will enhance your experience")
-            plan_parts.append("- Consider private tours and exclusive experiences")
+        # Validate passenger numbers
+        if adults < 1:
+            return "Error: At least one adult passenger is required."
+        if any(num < 0 for num in [adults, children, infants_in_seat, infants_on_lap]):
+            return "Error: Passenger numbers cannot be negative."
             
-        # Add interest-based recommendations if provided
-        if interests:
-            plan_parts.append(f"\n## Interest-Based Recommendations")
-            interests_list = [i.strip() for i in interests.split(",")]
-            for interest in interests_list:
-                plan_parts.append(f"- For {interest}: Customized activities will be recommended by your AI assistant")
-                
+        # Validate seat class
+        valid_classes = DEFAULT_CONFIG["seat_classes"]
+        if seat_class.lower() not in valid_classes:
+            return f"Error: Seat class must be one of {', '.join(valid_classes)}."
+    
+    except ValueError:
+        return "Error: Invalid date format. Please use YYYY-MM-DD format."
+
+    # Import fast_flights here to avoid startup issues
+    try:
         if ctx:
-            ctx.report_progress(2, 2)
-            ctx.info("Travel plan creation complete!")
-                
-        return "\n".join(plan_parts)
+            ctx.info("Importing fast_flights module")
+        from fast_flights import FlightData, Passengers, Result, get_flights
+    except ImportError as e:
+        error_msg = f"Error importing fast_flights: {str(e)}"
+        if ctx:
+            ctx.error(error_msg)
+        return f"Error: Unable to import fast_flights library. Please make sure it's installed correctly. Error details: {error_msg}"
+    
+    # Create flight data
+    try:
+        if ctx:
+            ctx.info("Creating flight data objects")
+        
+        flight_data = [FlightData(date=departure_date, from_airport=from_airport, to_airport=to_airport)]
+        
+        # Add return flight if return_date is provided
+        if return_date:
+            flight_data.append(FlightData(date=return_date, from_airport=to_airport, to_airport=from_airport))
+        
+        # Set trip type based on whether a return date was provided
+        trip_type = "round-trip" if return_date else "one-way"
+        
+        # Create passengers object
+        passengers = Passengers(
+            adults=adults,
+            children=children,
+            infants_in_seat=infants_in_seat,
+            infants_on_lap=infants_on_lap
+        )
+        
+        if ctx:
+            ctx.info("Calling get_flights API")
+            ctx.report_progress(0.5, 1.0)
+            
+        # Get flight results
+        result: Result = get_flights(
+            flight_data=flight_data,
+            trip=trip_type,
+            seat=seat_class,
+            passengers=passengers,
+            fetch_mode="fallback",  # Use fallback mode for more reliable results
+        )
+        
+        if ctx:
+            ctx.info("Processing flight results")
+            ctx.report_progress(1.0, 1.0)
+            
+        # Format results
+        return format_flight_results(result, trip_type, DEFAULT_CONFIG["max_results"])
         
     except Exception as e:
-        return f"Error creating travel plan: {str(e)}"
+        error_msg = f"Error searching for flights: {str(e)}"
+        if ctx:
+            ctx.error(error_msg)
+        return error_msg
 
-@mcp.resource("airport_codes://{query}")
-def get_airport_codes(query: str) -> str:
-    """
-    Get airport codes that match a search query.
-    This is a simplified implementation that returns common airport codes.
+def format_flight_results(result, trip_type: str, max_results: int) -> str:
+    """Format flight results into a readable string."""
+    if not result or not hasattr(result, 'flights') or not result.flights:
+        return "No flights found matching your criteria."
     
-    Args:
-        query: A search string (city name, airport name, or partial code)
+    output = []
+    output.append(f"Found {len(result.flights)} flight options.")
+    
+    if hasattr(result, 'current_price'):
+        output.append(f"Price assessment: {result.current_price}")
+    
+    output.append("\n")
+    
+    for i, flight in enumerate(result.flights[:max_results], 1):  # Limit to max results
+        best_tag = " [BEST OPTION]" if hasattr(flight, 'is_best') and flight.is_best else ""
+        output.append(f"Option {i}{best_tag}:")
         
-    Returns:
-        A list of matching airport codes with descriptions
-    """
-    # Simplified database of common airports
-    airports = {
-        "nyc": "NYC - New York City (all airports)",
-        "jfk": "JFK - John F. Kennedy International Airport, New York",
-        "lga": "LGA - LaGuardia Airport, New York",
-        "ewr": "EWR - Newark Liberty International Airport, New Jersey",
-        "lax": "LAX - Los Angeles International Airport, California",
-        "sfo": "SFO - San Francisco International Airport, California",
-        "ord": "ORD - O'Hare International Airport, Chicago",
-        "dfw": "DFW - Dallas/Fort Worth International Airport, Texas",
-        "mia": "MIA - Miami International Airport, Florida",
-        "sea": "SEA - Seattle-Tacoma International Airport, Washington",
-        "las": "LAS - Harry Reid International Airport, Las Vegas",
-        "atl": "ATL - Hartsfield-Jackson Atlanta International Airport, Georgia",
-        "den": "DEN - Denver International Airport, Colorado",
-        "bos": "BOS - Boston Logan International Airport, Massachusetts",
-        "lhr": "LHR - London Heathrow Airport, United Kingdom",
-        "cdg": "CDG - Charles de Gaulle Airport, Paris, France",
-        "fra": "FRA - Frankfurt Airport, Germany",
-        "ams": "AMS - Amsterdam Airport Schiphol, Netherlands",
-        "hnd": "HND - Tokyo Haneda Airport, Japan",
-        "nrt": "NRT - Narita International Airport, Tokyo, Japan",
-        "pek": "PEK - Beijing Capital International Airport, China",
-        "pvg": "PVG - Shanghai Pudong International Airport, China",
-        "syd": "SYD - Sydney Airport, Australia",
-        "sin": "SIN - Singapore Changi Airport, Singapore",
-        "dxb": "DXB - Dubai International Airport, United Arab Emirates",
-        "tpe": "TPE - Taiwan Taoyuan International Airport, Taiwan",
-        "myj": "MYJ - Matsuyama Airport, Japan"
-    }
-    
-    query = query.lower()
-    
-    # Search the airports dictionary
-    results = []
-    for code, description in airports.items():
-        if query in code.lower() or query in description.lower():
-            results.append(description)
+        if hasattr(flight, 'name'):
+            output.append(f"  Airline: {flight.name}")
+        
+        if hasattr(flight, 'departure'):
+            output.append(f"  Departure: {flight.departure}")
+        
+        if hasattr(flight, 'arrival'):
+            output.append(f"  Arrival: {flight.arrival}")
+        
+        if hasattr(flight, 'arrival_time_ahead') and flight.arrival_time_ahead:
+            output.append(f"  Arrives: {flight.arrival_time_ahead}")
             
-    if not results:
-        return "No matching airports found. Try a different search term."
+        if hasattr(flight, 'duration'):
+            output.append(f"  Duration: {flight.duration}")
         
-    return "\n".join(results)
-
-@mcp.prompt()
-def flight_search_prompt(from_airport: str, to_airport: str, date: str) -> str:
-    """
-    Create a prompt for searching flights between two airports on a specific date.
+        if hasattr(flight, 'stops'):
+            output.append(f"  Stops: {flight.stops}")
+        
+        if hasattr(flight, 'delay') and flight.delay:
+            output.append(f"  Delay: {flight.delay}")
+            
+        if hasattr(flight, 'price'):
+            output.append(f"  Price: {flight.price}")
+        
+        output.append("")
     
+    if len(result.flights) > max_results:
+        output.append(f"... and {len(result.flights) - max_results} more flight options available.")
+    
+    if trip_type == "round-trip":
+        output.append("Note: Price shown is for the entire round trip.")
+    
+    return "\n".join(output)
+
+@mcp.tool()
+def airport_search(query: str, ctx: Context = None) -> str:
+    """
+    Search for airport codes by name or city.
+
     Args:
-        from_airport: Departure airport code
-        to_airport: Arrival airport code
-        date: Travel date in YYYY-MM-DD format
-        
-    Returns:
-        A formatted prompt for the AI assistant
-    """
-    return f"""Please search for flights from {from_airport} to {to_airport} on {date}.
-    
-I'd like to see options for departure times, prices, and any recommendations you have about the best value flights."""
+        query: The search term (city name, airport name, or partial code)
 
-@mcp.prompt()
-def travel_plan_prompt(
-    from_airport: str, 
-    to_airport: str, 
-    dates: str, 
-    purpose: str, 
-    interests: str
-) -> str:
+    Returns:
+        List of matching airports with their codes
     """
-    Create a prompt for generating a comprehensive travel plan.
+    if ctx:
+        ctx.info(f"Searching for airports matching: {query}")
     
+    if not query or len(query.strip()) < 2:
+        return "Please provide at least 2 characters to search for airports."
+    
+    query = query.strip().upper()
+    matches = []
+    
+    # Search by airport code or name
+    for code, name in airports.items():
+        if query in code or query.upper() in name.upper():
+            matches.append(f"{name} ({code})")
+    
+    if not matches:
+        return f"No airports found matching '{query}'."
+    
+    # Sort matches and format the output
+    matches.sort()
+    result = [f"Found {len(matches)} airports matching '{query}':"]
+    result.extend(matches[:20])  # Limit to 20 results
+    
+    if len(matches) > 20:
+        result.append(f"...and {len(matches) - 20} more. Please refine your search to see more specific results.")
+        
+    return "\n".join(result)
+
+@mcp.tool()
+def get_travel_dates(days_from_now: Optional[int] = None, trip_length: Optional[int] = None) -> str:
+    """
+    Get suggested travel dates based on days from now and trip length.
+
     Args:
-        from_airport: Departure airport code
-        to_airport: Arrival airport code
-        dates: Travel dates range in format "YYYY-MM-DD to YYYY-MM-DD"
-        purpose: Purpose of the trip (e.g., vacation, business)
-        interests: Comma-separated list of interests
-        
+        days_from_now: Number of days from today for departure 
+                      (default: configured default_advance_days)
+        trip_length: Length of the trip in days
+                     (default: configured default_trip_days)
+
     Returns:
-        A formatted prompt for the AI assistant
+        Suggested travel dates in YYYY-MM-DD format
     """
-    return f"""Please create a comprehensive travel plan for my trip from {from_airport} to {to_airport} on {dates}.
+    # Use configured defaults if not provided
+    if days_from_now is None:
+        days_from_now = DEFAULT_CONFIG["default_advance_days"]
+    if trip_length is None:
+        trip_length = DEFAULT_CONFIG["default_trip_days"]
+    
+    if days_from_now < 1:
+        return "Error: Days from now must be at least 1."
+    if trip_length < 1:
+        return "Error: Trip length must be at least 1 day."
+    
+    today = datetime.now()
+    departure_date = today + timedelta(days=days_from_now)
+    return_date = departure_date + timedelta(days=trip_length)
+    
+    departure_str = departure_date.strftime("%Y-%m-%d")
+    return_str = return_date.strftime("%Y-%m-%d")
+    
+    return f"Departure date: {departure_str}\nReturn date: {return_str}"
 
-Trip Purpose: {purpose}
-Interests: {interests}
+@mcp.tool()
+async def update_airports_database(ctx: Context = None) -> str:
+    """
+    Update the airports database from the configured CSV source.
 
-I'd like information about:
-1. Flight options and recommendations
-2. Accommodation suggestions
-3. Activities and attractions based on my interests
-4. Local transportation options
-5. Budget considerations
-6. Any travel tips specific to my destination
-
-Thank you!"""
-
-# Run the server with stdio transport
-if __name__ == "__main__":
+    Returns:
+        Status message with the number of airports loaded
+    """
+    if ctx:
+        ctx.info("Starting airport database update")
+        ctx.report_progress(0.1, 1.0)
+    
     try:
-        # Try importing fast_flights to verify it's installed
-        import fast_flights
-        print("Starting Flight Planner MCP Server...")
-        mcp.run(transport="stdio")
-    except ImportError:
-        print("""
-ERROR: The fast-flights package is not installed.
-Please install it with: pip install fast-flights
-        """)
+        if ctx:
+            ctx.info(f"Fetching airports from {CSV_URL}")
+            ctx.report_progress(0.3, 1.0)
+        
+        global airports
+        fresh_airports = await fetch_airports_csv()
+        
+        if not fresh_airports:
+            return "Error: Failed to fetch airports or no valid airports found"
+        
+        # Update the global airports dictionary
+        airports = fresh_airports
+        
+        if ctx:
+            ctx.report_progress(1.0, 1.0)
+        
+        return f"Successfully updated airports database with {len(airports)} airports"
+    
+    except Exception as e:
+        error_msg = f"Error updating airports: {str(e)}"
+        if ctx:
+            ctx.error(error_msg)
+        return error_msg
+
+@mcp.resource("airports://all")
+def get_all_airports() -> str:
+    """Get a list of all available airports."""
+    result = [f"Available Airports ({len(airports)} total):"]
+    for code, name in sorted(airports.items())[:100]:  # Limit to first 100 to avoid overwhelming
+        result.append(f"{code}: {name}")
+    
+    if len(airports) > 100:
+        result.append(f"... and {len(airports) - 100} more airports. Use airport_search tool to find specific airports.")
+    
+    return "\n".join(result)
+
+@mcp.resource("airports://{code}")
+def get_airport_info(code: str) -> str:
+    """Get information about a specific airport by its code."""
+    code = code.upper()
+    if code in airports:
+        return f"{code}: {airports[code]}"
+    return f"Airport code '{code}' not found"
+
+@mcp.prompt()
+def plan_trip(destination: str) -> str:
+    """Create a prompt for trip planning to a specific destination."""
+    return f"""I'd like to plan a trip to {destination}. Can you help me with the following:
+
+1. What's the best time of year to visit {destination}?
+2. How long should I plan to stay to see the major attractions?
+3. What are the must-see places in {destination}?
+4. What's the typical cost range for accommodations?
+5. Are there any travel advisories or cultural considerations I should be aware of?
+
+After you answer these questions, could you help me find flights to {destination} using the flight search tool?"""
+
+@mcp.prompt()
+def compare_destinations(destination1: str, destination2: str) -> str:
+    """Create a prompt for comparing two travel destinations."""
+    return f"""I'm trying to decide between traveling to {destination1} and {destination2}. 
+Can you help me compare these destinations on the following factors:
+
+1. Weather and best time to visit each location
+2. Cost of travel and accommodations
+3. Popular attractions and activities
+4. Food and cultural experiences
+5. Safety and travel considerations
+
+Based on these factors, which would you recommend and why?
+After your recommendation, could you show me flight options for both destinations?"""
+
+# Initialize airports on startup - this is crucial
+async def initialize_airports():
+    """Initialize airport data at startup."""
+    global airports
+    
+    # First try to load from cache
+    cache = load_airports_cache()
+    if cache:
+        airports = cache
+    
+    # If cache is empty, fetch from CSV
+    if not airports:
+        fresh_airports = await fetch_airports_csv()
+        if fresh_airports:
+            airports = fresh_airports
+    
+    print(f"Initialized with {len(airports)} airports", file=sys.stderr)
+
+# Run the server
+if __name__ == "__main__":
+    print("Initializing airports database...", file=sys.stderr)
+    # Run the initialization in an event loop
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(initialize_airports())
+    
+    print("Starting server - waiting for connections...", file=sys.stderr)
+    try:
+        # This will keep the server running until interrupted
+        mcp.run()
+    except Exception as e:
+        print(f"Error running server: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
